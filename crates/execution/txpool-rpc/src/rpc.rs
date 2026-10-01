@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 /// submitted before the Everest hard fork is active at the latest block.
 ///
 /// EIP-8130 validity transactions are fork-gated on Everest; other transaction types (e.g. EIP-1559)
-/// carry validity predicates under the experimental flag alone.
+/// carry validity predicates without a fork gate.
 pub const VALIDITY_TX_PRE_EVEREST_RPC_ERROR: &str = "EIP-8130 validity transactions are gated behind \
      the Everest hard fork; they are not accepted before Everest is active";
 
@@ -326,8 +326,8 @@ where
             })?;
 
         // EIP-8130 (account abstraction) validity transactions are fork-gated on Everest. Other
-        // transaction types (e.g. EIP-1559) carry validity predicates under the experimental flag
-        // alone and are accepted before Everest activates.
+        // transaction types (e.g. EIP-1559) carry validity predicates without a fork gate and are
+        // accepted before Everest activates.
         let everest_active = latest.is_some_and(|(_, timestamp)| {
             self.provider.chain_spec().is_everest_active_at_timestamp(timestamp)
         });
@@ -824,8 +824,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_raw_transaction_validity_accepts_eip1559_before_everest() {
-        // EIP-1559 validity transactions are gated by the experimental flag alone, not by Everest,
-        // so they clear the fork gate before Everest activates. The admission event fires only once
+        // EIP-1559 validity transactions are not gated by Everest, so they clear the fork gate
+        // before Everest activates. The admission event fires only once
         // the gate is cleared; the noop pool then rejects insertion.
         let capture = TransactionEventCapture::install();
         let signer = PrivateKeySigner::random();
