@@ -185,12 +185,9 @@ pub struct Args {
     #[arg(long = "builder.enable-resource-metering", default_value = "false")]
     pub enable_resource_metering: bool,
 
-    /// Enable experimental validity-bearing transactions on this builder.
-    ///
-    /// Registers `base_sendRawTransactionValidity` for direct ingress and accepts
-    /// validity metadata on `base_insertValidatedTransaction` from forwarding nodes.
-    /// Predicates are preserved and enforced during block construction.
-    #[arg(long = "builder.enable-experimental-validity-transactions", default_value = "false")]
+    /// Deprecated and ignored. Validity transactions are always enabled once Cobalt is active.
+    /// Kept so older deployment configurations remain accepted.
+    #[arg(long = "builder.enable-experimental-validity-transactions", hide = true)]
     pub enable_experimental_validity_transactions: bool,
 
     /// Maximum validity predicates accepted per validity transaction.
@@ -362,18 +359,18 @@ impl Args {
     ///
     /// # Errors
     ///
-    /// Returns an error when shadow injection is enabled without validity transaction support.
+    /// Returns an error when the shadow injection sample rate is out of range.
     pub fn builder_api_config(&self) -> eyre::Result<BuilderApiExtensionConfig> {
+        if self.enable_experimental_validity_transactions {
+            warn!("deprecated --builder.enable-experimental-validity-transactions flag is ignored");
+        }
         let shadow_validity = if self.shadow_validity_injection_enabled {
             ShadowValidityConfig::enabled(self.shadow_validity_injection_sample_rate_bps)?
         } else {
             ShadowValidityConfig::disabled()
         };
-        Ok(BuilderApiExtensionConfig::new(
-            self.enable_experimental_validity_transactions,
-            self.validity_max_predicates,
-        )
-        .with_shadow_validity(shadow_validity)?)
+        Ok(BuilderApiExtensionConfig::new(self.validity_max_predicates)
+            .with_shadow_validity(shadow_validity))
     }
 
     /// Converts these CLI arguments into a [`BuilderConfig`] using the given shared metering
@@ -457,7 +454,6 @@ mod tests {
     #[test]
     fn default_args_produce_valid_config() {
         let args = Args::default();
-        assert!(!args.enable_experimental_validity_transactions);
         assert_eq!(args.validity_max_predicates, DEFAULT_MAX_VALIDITY_PREDICATES);
         assert!(!args.shadow_validity_injection_enabled);
         assert_eq!(args.shadow_validity_injection_sample_rate_bps, 100);
@@ -469,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn experimental_validity_transactions_require_explicit_opt_in() {
+    fn deprecated_experimental_validity_flag_remains_accepted() {
         let parsed = CommandParser::parse_from([
             "builder",
             "--builder.enable-experimental-validity-transactions",
@@ -477,8 +473,7 @@ mod tests {
             "8",
         ]);
 
-        assert!(parsed.args.enable_experimental_validity_transactions);
-        assert_eq!(parsed.args.validity_max_predicates, 8);
+        assert_eq!(parsed.args.builder_api_config().unwrap().max_validity_predicates, 8);
     }
 
     #[test]
@@ -506,24 +501,19 @@ mod tests {
     }
 
     #[test]
-    fn validity_max_predicates_accepts_the_wire_ceiling_without_experimental_override() {
+    fn validity_max_predicates_accepts_the_wire_ceiling() {
         let parsed = CommandParser::parse_from([
             "builder",
             "--builder.validity-max-predicates",
             &DEFAULT_MAX_VALIDITY_PREDICATES.to_string(),
         ]);
 
-        assert!(!parsed.args.enable_experimental_validity_transactions);
         assert_eq!(parsed.args.validity_max_predicates, DEFAULT_MAX_VALIDITY_PREDICATES);
     }
 
     #[test]
-    fn shadow_validity_injection_requires_validity_support() {
-        let args = Args { shadow_validity_injection_enabled: true, ..Default::default() };
-        assert!(args.builder_api_config().is_err());
-
+    fn shadow_validity_injection_maps_to_config() {
         let args = Args {
-            enable_experimental_validity_transactions: true,
             shadow_validity_injection_enabled: true,
             shadow_validity_injection_sample_rate_bps: 250,
             ..Default::default()

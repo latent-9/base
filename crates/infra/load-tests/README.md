@@ -470,9 +470,7 @@ predicate; setting both or neither is a configuration error.
 
 **Required setup for end-to-end evaluation.** The ingress and builder must run a
 version that pre-registers the validity RPC. The endpoint and builder extension
-acceptance become active at Cobalt, without a restart at activation. Before Cobalt,
-opt in on ingress with `--enable-experimental-validity-transactions` and on the
-builder with `--builder.enable-experimental-validity-transactions`. If forwarding
+acceptance become active at Cobalt, without a restart at activation. If forwarding
 is used, configure `--enable-tx-forwarding` and `--builder-rpc-urls=<url>` on ingress.
 The submission proxy must also route `base_sendRawTransactionValidity` to that ingress.
 Rejected requests must not be retried as plain `eth_sendRawTransaction`.

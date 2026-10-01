@@ -8,7 +8,10 @@ use alloy_primitives::{Address, U256};
 use alloy_provider::Provider;
 use base_builder_core::{
     BuilderApiExtension, BuilderApiExtensionConfig, BuilderConfig, DEFAULT_MAX_VALIDITY_PREDICATES,
-    test_utils::{ChainDriverExt, LocalInstanceBuilder, ONE_ETH},
+    test_utils::{
+        ChainDriverExt, LocalInstanceBuilder, ONE_ETH, chain_spec_with_cobalt,
+        node_config_with_chain_spec,
+    },
 };
 use base_execution_txpool::{
     TransactionValidity, ValidatedTransaction, ValidityOperator, ValidityPredicate,
@@ -16,9 +19,11 @@ use base_execution_txpool::{
 use base_observability_events::{TransactionEventCapture, TransactionEventType};
 
 fn validity_instance() -> LocalInstanceBuilder {
-    LocalInstanceBuilder::new(BuilderConfig::for_tests()).install_ext::<BuilderApiExtension>(
-        BuilderApiExtensionConfig::new(true, DEFAULT_MAX_VALIDITY_PREDICATES).with_noop_metering(),
-    )
+    LocalInstanceBuilder::new(BuilderConfig::for_tests())
+        .with_node_config(node_config_with_chain_spec(chain_spec_with_cobalt()))
+        .install_ext::<BuilderApiExtension>(
+            BuilderApiExtensionConfig::new(DEFAULT_MAX_VALIDITY_PREDICATES).with_noop_metering(),
+        )
 }
 
 #[tokio::test]

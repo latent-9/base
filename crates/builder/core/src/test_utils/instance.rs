@@ -432,6 +432,19 @@ pub fn default_node_config_with_azul() -> NodeConfig<BaseChainSpec> {
     node_config_with_chain_spec(chain_spec_with_azul())
 }
 
+/// Returns a chain spec identical to the default test chain spec but with every Base upgrade
+/// through `BaseUpgrade::Cobalt` activated at genesis, so validity transactions are accepted.
+pub fn chain_spec_with_cobalt() -> Arc<BaseChainSpec> {
+    use base_common_evm::BaseUpgrade;
+    use reth_chainspec::ForkCondition;
+
+    let mut spec = Arc::unwrap_or_clone(chain_spec_with_azul());
+    for upgrade in [BaseUpgrade::Beryl, BaseUpgrade::Cobalt] {
+        spec.inner.hardforks.insert(upgrade, ForkCondition::Timestamp(0));
+    }
+    Arc::new(spec)
+}
+
 /// Builds a [`LocalInstance`]-style Reth node configuration for the given chain spec.
 ///
 /// Uses the same IPC-only RPC setup, disabled discovery, unused ports, and temporary data

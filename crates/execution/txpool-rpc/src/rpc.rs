@@ -121,7 +121,6 @@ pub struct SendRawTransactionValidityApiImpl<Provider> {
     provider: Provider,
     max_validity_predicates: usize,
     max_validity_expiry_secs: u64,
-    experimental_override: bool,
     sequencer_client: Option<SequencerClient>,
     transaction_sender: tokio::sync::mpsc::UnboundedSender<BatchTxRequest<BasePooledTransaction>>,
 }
@@ -171,15 +170,9 @@ impl<Provider> SendRawTransactionValidityApiImpl<Provider> {
             provider,
             max_validity_predicates,
             max_validity_expiry_secs,
-            experimental_override: false,
             sequencer_client: None,
             transaction_sender,
         }
-    }
-    /// Allows validity submissions before Cobalt for experimental deployments.
-    pub const fn with_experimental_override(mut self, enabled: bool) -> Self {
-        self.experimental_override = enabled;
-        self
     }
     /// Proxies validity submissions to the configured sequencer rather than the local pool.
     pub fn with_sequencer_client(mut self, client: SequencerClient) -> Self {
@@ -293,19 +286,17 @@ where
         }
 
         let latest = self.latest_block_number_and_timestamp()?;
-        if !self.experimental_override {
-            let active = latest.is_some_and(|(_, timestamp)| {
-                self.provider.chain_spec().is_cobalt_active_at_timestamp(
-                    timestamp.saturating_add(LEGACY_BLOCK_INTERVAL_MILLIS / 1_000),
-                )
-            });
-            if !active {
-                return Err(ErrorObjectOwned::owned(
-                    ErrorCode::InvalidParams.code(),
-                    VALIDITY_TX_PRE_COBALT_RPC_ERROR,
-                    None::<()>,
-                ));
-            }
+        let active = latest.is_some_and(|(_, timestamp)| {
+            self.provider.chain_spec().is_cobalt_active_at_timestamp(
+                timestamp.saturating_add(LEGACY_BLOCK_INTERVAL_MILLIS / 1_000),
+            )
+        });
+        if !active {
+            return Err(ErrorObjectOwned::owned(
+                ErrorCode::InvalidParams.code(),
+                VALIDITY_TX_PRE_COBALT_RPC_ERROR,
+                None::<()>,
+            ));
         }
 
         ValidityPredicate::validate_batch(&options.validity, self.max_validity_predicates)
@@ -806,16 +797,6 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(rejected.message(), VALIDITY_TX_PRE_COBALT_RPC_ERROR);
-
-        let override_rpc = rpc.with_experimental_override(true);
-        let rejected = override_rpc
-            .send_raw_transaction_validity(
-                Bytes::new(),
-                SendRawTransactionValidityOptions { validity: vec![] },
-            )
-            .await
-            .unwrap_err();
-        assert!(rejected.message().contains("validity predicates must not be empty"));
 
         let cobalt = MockEthProvider::<BasePrimitives>::new()
             .with_chain_spec(Arc::new(

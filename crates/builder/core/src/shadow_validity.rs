@@ -32,9 +32,6 @@ pub enum ShadowValidityConfigError {
     /// The configured sampling rate is zero or exceeds 100%.
     #[error("shadow validity sample rate must be between 1 and 10000 basis points")]
     InvalidSampleRate,
-    /// Injection was enabled without enabling validity extensions.
-    #[error("shadow validity injection requires experimental validity transactions to be enabled")]
-    ValidityTransactionsDisabled,
 }
 
 /// Configuration for decorating forwarded transactions with shadow-only validity predicates.
@@ -136,7 +133,6 @@ pub struct ShadowValidityBuilderApi<P, Provider> {
     inner: BuilderApiImpl<P, TransactionValidity>,
     config: ShadowValidityConfig,
     provider: Provider,
-    experimental_override: bool,
 }
 
 impl<P, Provider> ShadowValidityBuilderApi<P, Provider> {
@@ -152,7 +148,6 @@ impl<P, Provider> ShadowValidityBuilderApi<P, Provider> {
                 .with_metering_cache(Arc::new(InsertMeteringAdapter(metering_provider))),
             config: config.shadow_validity,
             provider,
-            experimental_override: config.accept_experimental_validity_transactions,
         }
     }
 }
@@ -167,7 +162,7 @@ where
         &self,
         mut tx: ValidatedTransaction<TransactionValidity>,
     ) -> RpcResult<()> {
-        if !tx.extensions.validity.is_empty() && !self.experimental_override {
+        if !tx.extensions.validity.is_empty() {
             let active = self
                 .provider
                 .latest_header()
@@ -278,11 +273,9 @@ mod tests {
     }
 
     #[test]
-    fn configuration_rejects_unsafe_combinations() {
+    fn configuration_rejects_out_of_range_sample_rates() {
         assert!(ShadowValidityConfig::enabled(0).is_err());
         assert!(ShadowValidityConfig::enabled(MAX_SHADOW_VALIDITY_SAMPLE_RATE_BPS + 1).is_err());
-        let shadow = ShadowValidityConfig::enabled(1).unwrap();
-        assert!(BuilderApiExtensionConfig::new(false, 1).with_shadow_validity(shadow).is_err());
-        assert!(BuilderApiExtensionConfig::new(true, 1).with_shadow_validity(shadow).is_ok());
+        assert!(ShadowValidityConfig::enabled(MAX_SHADOW_VALIDITY_SAMPLE_RATE_BPS).is_ok());
     }
 }
