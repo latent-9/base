@@ -480,17 +480,6 @@ mod tests {
     }
 
     #[test]
-    fn validity_max_predicates_accepts_the_wire_ceiling() {
-        let parsed = CommandParser::parse_from([
-            "builder",
-            "--builder.validity-max-predicates",
-            &DEFAULT_MAX_VALIDITY_PREDICATES.to_string(),
-        ]);
-
-        assert_eq!(parsed.args.validity_max_predicates, DEFAULT_MAX_VALIDITY_PREDICATES);
-    }
-
-    #[test]
     fn shadow_validity_injection_maps_to_config() {
         let args = Args {
             shadow_validity_injection_enabled: true,

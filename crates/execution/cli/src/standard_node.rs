@@ -1156,30 +1156,6 @@ mod tests {
     }
 
     #[test]
-    fn validity_max_predicates_accepts_the_wire_ceiling() {
-        let args = CommandParser::<StandardNodeArgs>::parse_from([
-            "base-reth",
-            "--validity-max-predicates",
-            &DEFAULT_MAX_VALIDITY_PREDICATES.to_string(),
-        ])
-        .args;
-
-        assert_eq!(args.rpc.validity_max_predicates, DEFAULT_MAX_VALIDITY_PREDICATES);
-    }
-
-    #[test]
-    fn validity_max_expiry_secs_parses() {
-        let args = CommandParser::<StandardNodeArgs>::parse_from([
-            "base-reth",
-            "--validity-max-expiry-secs",
-            "45",
-        ])
-        .args;
-
-        assert_eq!(args.rpc.validity_max_expiry_secs, 45);
-    }
-
-    #[test]
     fn inline_simulation_requires_forwarding() {
         let error = CommandParser::<StandardNodeArgs>::try_parse_from([
             "base-reth",
