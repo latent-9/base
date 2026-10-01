@@ -185,11 +185,6 @@ pub struct Args {
     #[arg(long = "builder.enable-resource-metering", default_value = "false")]
     pub enable_resource_metering: bool,
 
-    /// Deprecated and ignored. Validity transactions are always enabled once Cobalt is active.
-    /// Kept so older deployment configurations remain accepted.
-    #[arg(long = "builder.enable-experimental-validity-transactions", hide = true)]
-    pub enable_experimental_validity_transactions: bool,
-
     /// Maximum validity predicates accepted per validity transaction.
     ///
     /// Capped at [`DEFAULT_MAX_VALIDITY_PREDICATES`], the fixed wire ceiling the
@@ -331,7 +326,6 @@ impl Default for Args {
             execution_metering_mode: ExecutionMeteringMode::Off,
             extra_block_deadline_secs: 20,
             enable_resource_metering: false,
-            enable_experimental_validity_transactions: false,
             validity_max_predicates: DEFAULT_MAX_VALIDITY_PREDICATES,
             shadow_validity_injection_enabled: false,
             shadow_validity_injection_sample_rate_bps: 100,
@@ -361,9 +355,6 @@ impl Args {
     ///
     /// Returns an error when the shadow injection sample rate is out of range.
     pub fn builder_api_config(&self) -> eyre::Result<BuilderApiExtensionConfig> {
-        if self.enable_experimental_validity_transactions {
-            warn!("deprecated --builder.enable-experimental-validity-transactions flag is ignored");
-        }
         let shadow_validity = if self.shadow_validity_injection_enabled {
             ShadowValidityConfig::enabled(self.shadow_validity_injection_sample_rate_bps)?
         } else {
@@ -462,18 +453,6 @@ mod tests {
         assert_eq!(config.block_time, Duration::from_millis(1000));
         assert!(config.max_gas_per_txn.is_none());
         assert!(config.manifest_precheck_enabled);
-    }
-
-    #[test]
-    fn deprecated_experimental_validity_flag_remains_accepted() {
-        let parsed = CommandParser::parse_from([
-            "builder",
-            "--builder.enable-experimental-validity-transactions",
-            "--builder.validity-max-predicates",
-            "8",
-        ]);
-
-        assert_eq!(parsed.args.builder_api_config().unwrap().max_validity_predicates, 8);
     }
 
     #[test]

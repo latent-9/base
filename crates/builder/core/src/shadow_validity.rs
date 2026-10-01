@@ -2,26 +2,16 @@
 
 use std::sync::Arc;
 
-use alloy_consensus::BlockHeader;
 use alloy_primitives::{TxHash, U256};
 use base_bundles::MeterBundleResponse;
-use base_common_chains::Upgrades;
 use base_execution_txpool::{
     BasePooledTransaction, BuilderApiImpl, BuilderApiServer, InsertMetering, TransactionValidity,
     ValidatedTransaction, ValidityOperator, ValidityPredicate,
 };
-use jsonrpsee::{
-    core::RpcResult,
-    types::{ErrorCode, ErrorObjectOwned},
-};
-use reth_chainspec::ChainSpecProvider;
-use reth_storage_api::BlockReaderIdExt;
+use jsonrpsee::core::RpcResult;
 use reth_transaction_pool::TransactionPool;
 
 use crate::{BuilderApiExtensionConfig, BuilderMetrics, SharedMeteringProvider};
-
-/// Cobalt activates before Denim, while full blocks are two seconds apart.
-const PRE_DENIM_BLOCK_INTERVAL_SECS: u64 = 2;
 
 /// Number of basis points representing a 100% sampling rate.
 pub const MAX_SHADOW_VALIDITY_SAMPLE_RATE_BPS: u16 = 10_000;
@@ -129,17 +119,15 @@ impl InsertMetering for InsertMeteringAdapter {
 
 /// Builder API that decorates sampled transactions before normal validated insertion.
 #[derive(Debug)]
-pub struct ShadowValidityBuilderApi<P, Provider> {
+pub struct ShadowValidityBuilderApi<P> {
     inner: BuilderApiImpl<P, TransactionValidity>,
     config: ShadowValidityConfig,
-    provider: Provider,
 }
 
-impl<P, Provider> ShadowValidityBuilderApi<P, Provider> {
+impl<P> ShadowValidityBuilderApi<P> {
     /// Creates a builder API using validated configuration.
     pub fn new(
         pool: P,
-        provider: Provider,
         config: BuilderApiExtensionConfig,
         metering_provider: SharedMeteringProvider,
     ) -> Self {
@@ -147,45 +135,19 @@ impl<P, Provider> ShadowValidityBuilderApi<P, Provider> {
             inner: BuilderApiImpl::with_extensions(pool, true, config.max_validity_predicates)
                 .with_metering_cache(Arc::new(InsertMeteringAdapter(metering_provider))),
             config: config.shadow_validity,
-            provider,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl<P, Provider> BuilderApiServer<TransactionValidity> for ShadowValidityBuilderApi<P, Provider>
+impl<P> BuilderApiServer<TransactionValidity> for ShadowValidityBuilderApi<P>
 where
     P: TransactionPool<Transaction = BasePooledTransaction> + Send + Sync + 'static,
-    Provider: BlockReaderIdExt + ChainSpecProvider<ChainSpec: Upgrades> + Send + Sync + 'static,
 {
     async fn insert_validated_transaction(
         &self,
         mut tx: ValidatedTransaction<TransactionValidity>,
     ) -> RpcResult<()> {
-        if !tx.extensions.validity.is_empty() {
-            let active = self
-                .provider
-                .latest_header()
-                .map_err(|error| {
-                    ErrorObjectOwned::owned(
-                        ErrorCode::InternalError.code(),
-                        error.to_string(),
-                        None::<()>,
-                    )
-                })?
-                .is_some_and(|header| {
-                    self.provider.chain_spec().is_cobalt_active_at_timestamp(
-                        header.timestamp().saturating_add(PRE_DENIM_BLOCK_INTERVAL_SECS),
-                    )
-                });
-            if !active {
-                return Err(ErrorObjectOwned::owned(
-                    ErrorCode::InvalidParams.code(),
-                    "transaction extensions are disabled before Cobalt",
-                    None::<()>,
-                ));
-            }
-        }
         let outcome = self.config.inject(&mut tx);
         if self.config.is_enabled() {
             BuilderMetrics::shadow_validity_injection_total(outcome.label()).increment(1);

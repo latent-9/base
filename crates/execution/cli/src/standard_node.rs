@@ -347,11 +347,6 @@ pub struct RpcStandardNodeArgs {
     )]
     pub enable_tx_forwarding: bool,
 
-    /// Deprecated and ignored. Validity transactions are always enabled once Cobalt is active.
-    /// Kept so older deployment configurations remain accepted.
-    #[arg(long = "enable-experimental-validity-transactions", hide = true)]
-    pub enable_experimental_validity_transactions: bool,
-
     /// Maximum validity predicates accepted per validity transaction.
     ///
     /// Capped at [`DEFAULT_MAX_VALIDITY_PREDICATES`], the fixed wire ceiling the
@@ -768,9 +763,6 @@ impl StandardBaseRethNode {
         runner.install_ext::<MeteringExtension>(metering_config);
         runner.install_ext::<ShadowIndexerExtension>((&args.shadow_indexer).try_into()?);
         let tx_forwarding_config: TxForwardingConfig = (&args).into();
-        if args.rpc.enable_experimental_validity_transactions {
-            warn!("deprecated --enable-experimental-validity-transactions flag is ignored");
-        }
         // Query nodes proxy validity metadata to their sequencer; forwarders submit locally.
         if args.rpc.enable_tx_forwarding || args.rpc.rollup_args.sequencer.is_some() {
             runner.install_ext::<SendRawTransactionValidityExtension>(
@@ -982,7 +974,6 @@ mod tests {
             enable_transaction_event_journal: false,
             transaction_event_journal_path: None,
             enable_tx_forwarding: false,
-            enable_experimental_validity_transactions: false,
             validity_max_predicates: DEFAULT_MAX_VALIDITY_PREDICATES,
             validity_max_expiry_secs: DEFAULT_MAX_VALIDITY_EXPIRY_SECS,
             builder_rpc_urls: Vec::new(),
@@ -1115,17 +1106,6 @@ mod tests {
         assert!(!config.enabled);
         assert!(config.builder_urls.is_empty());
         assert!(!config.inline_simulation);
-    }
-
-    #[test]
-    fn deprecated_experimental_validity_flag_remains_accepted() {
-        let args = CommandParser::<StandardNodeArgs>::parse_from([
-            "base-reth",
-            "--enable-experimental-validity-transactions",
-        ])
-        .args;
-
-        StandardBaseRethNode::runner(args).expect("deprecated flag should be ignored");
     }
 
     #[test]

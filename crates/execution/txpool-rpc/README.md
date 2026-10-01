@@ -35,7 +35,6 @@ use base_txpool_rpc::{
 };
 
 runner.install_ext::<TxPoolRpcExtension>(TxPoolRpcConfig::default());
-// The endpoint is pre-registered and rejects submissions until Cobalt is active.
 runner.install_ext::<SendRawTransactionValidityExtension>(
     SendRawTransactionValidityConfig::default(),
 );

@@ -176,8 +176,7 @@ just anvil-nitro-local up
 Set `L2_BASE_DENIM_BLOCK` to another block to move activation, or set it to an
 empty value to leave Denim unscheduled.
 
-Validity transactions are accepted once Cobalt is active. To exercise them on the
-native payload builder, the deployment must schedule Denim and configure both sides
+To exercise validity transactions on the native payload builder, the deployment must schedule Denim and configure both sides
 of the forwarding path:
 
 - builder: `--builder.payload-builder-cutover`. The builder always registers
