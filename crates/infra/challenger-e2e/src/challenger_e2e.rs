@@ -1,15 +1,17 @@
 //! Drives a real challenger binary against a throwaway fork of the target L1.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, path::Path, sync::Arc, time::Duration};
 
+use alloy_consensus::Transaction as _;
 use alloy_node_bindings::{Anvil, AnvilInstance};
-use alloy_primitives::{Address, B256, Bytes, U256, hex};
-use alloy_provider::{Provider, RootProvider};
+use alloy_primitives::{Address, Bytes, U256, hex};
+use alloy_provider::{Provider, RootProvider, network::TransactionResponse as _};
+use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_signer_local::PrivateKeySigner;
 use base_proof_contracts::{
     AggregateVerifierClient, AggregateVerifierContractClient, AnchorStateRegistryClient,
     AnchorStateRegistryContractClient, DisputeGameFactoryClient, DisputeGameFactoryContractClient,
-    GameStatus, describe_revert, encode_nullify_calldata,
+    GameStatus, decode_dispute_calldata, describe_revert, encode_nullify_calldata,
 };
 use base_proof_rpc::L2HttpProvider;
 use base_proof_submission::{AggregateProofSubmitter, ProofSubmissionError};
@@ -25,26 +27,15 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{
-    config::{Config, Scenario},
+    config::{Config, ProverMode, Scenario},
     metrics::Scrape,
+    mock_prover::MockProver,
+    mock_verifier,
 };
 
 /// Wei granted to each throwaway account on the fork. Orders of magnitude more
 /// than a dispute costs, and worthless outside the pod.
 const FUNDING_WEI: u128 = 100_000_000_000_000_000_000;
-
-/// Handshake file the driver writes to release the challenger sidecar, which
-/// blocks on it appearing. The sidecar hardcodes the same path, so this was
-/// never independently configurable.
-const CHALLENGER_ENV_FILE: &str = "/shared/challenger.env";
-
-/// EVM runtime that returns ABI `true` for every call:
-/// `PUSH1 1; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN`.
-///
-/// Stands in for the TEE verifier while Path 3 is staged, so a dummy TEE
-/// proof passes without a real enclave signature.
-const PERMISSIVE_VERIFIER_RUNTIME: &[u8] =
-    &[0x60, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
 
 /// Counters that must stay at zero for as long as every game on the fork is
 /// valid. Checked absolutely at the baseline and as a delta over the window.
@@ -175,14 +166,17 @@ impl std::fmt::Display for Verdict {
 ///
 /// See the crate README for the full argument; the short version is that the
 /// fork is built from a real chain and the games under test were created and
-/// verified on that chain, so nothing about the dispute is stubbed.
+/// verified on that chain. In the default `mock` prover mode the proofs and
+/// the verifiers that check them are stubbed, and the driver asserts instead
+/// what the verifier would have checked: that every dispute proved the
+/// canonical root at the corrupted index. In `real` mode nothing is stubbed.
 #[derive(Debug)]
 pub struct ChallengerE2e;
 
 impl ChallengerE2e {
     /// Runs the test to completion. An `Ok` return means the challenger passed.
     pub async fn run() -> Result<()> {
-        let config = Config::parse();
+        let mut config = Config::parse();
 
         // Two distinct accounts: A (driver) signs setup only, B is the
         // challenger. Both are generated per run and never leave the pod.
@@ -196,6 +190,7 @@ impl ChallengerE2e {
         info!(
             phase = %Phase::Setup,
             scenario = ?config.scenario,
+            prover = ?config.prover,
             challenger_address = %challenger.address(),
             driver_address = %driver.address(),
             quiet_window = ?config.quiet_window,
@@ -208,7 +203,21 @@ impl ChallengerE2e {
         let anvil = Self::spawn_fork(&config)?;
         let fork_url = anvil.endpoint_url();
         let provider: RootProvider = RootProvider::new_http(fork_url.clone());
+        config.fork_block = provider.get_block_number().await?;
         Self::fund(&provider, &[driver.address(), challenger.address()]).await?;
+
+        // Up before anything asks for a proof: the dual-proof staging below
+        // does, and so does the challenger once released. Held until the end of
+        // run(), like the fork. Every later use of `zk_rpc_url` — the driver's
+        // staging and the challenger's env file — now points at the mock.
+        let _mock_prover = match config.prover {
+            ProverMode::Mock => {
+                let mock = MockProver::start(config.mock_proving_time).await?;
+                config.zk_rpc_url = mock.url().clone();
+                Some(mock)
+            }
+            ProverMode::Real => None,
+        };
 
         let factory = DisputeGameFactoryContractClient::new(
             config.dispute_game_factory_addr,
@@ -224,6 +233,15 @@ impl ChallengerE2e {
         // measured against a fork that already contains the target games.
         let (game_a, game_b) =
             Self::select_games(&config, &factory, &verifier, &anchor_registry).await?;
+        if config.prover == ProverMode::Mock {
+            Self::install_mock_verifiers(
+                &config,
+                &provider,
+                &verifier,
+                [game_a.address, game_b.address],
+            )
+            .await?;
+        }
 
         // Taken before the challenger boots. Every dispute assertion below is
         // scoped to A or B, so without this a challenger that also disputes
@@ -241,7 +259,7 @@ impl ChallengerE2e {
                 .await?;
         }
 
-        Self::release_challenger(&fork_url, &challenger)?;
+        Self::release_challenger(&config.env_file, &fork_url, &config.zk_rpc_url, &challenger)?;
         Self::await_first_scan(&config).await?;
 
         Self::assert_quiet_on_valid_games(&config).await?;
@@ -263,7 +281,7 @@ impl ChallengerE2e {
             // counters are still absolutely zero once the first scan completes.
             let submitted = Self::disputes_submitted(&config).await?;
 
-            let (nonce, dual_before) = Self::stage_path3(
+            let (nonce, dual_before, checkpoint) = Self::stage_path3(
                 &config,
                 &fork_url,
                 &verifier,
@@ -286,6 +304,15 @@ impl ChallengerE2e {
                 nonce,
                 submitted,
                 dual_before,
+            )
+            .await?;
+            Self::assert_disputes_prove_canonical(
+                &config,
+                &provider,
+                &challenger,
+                game_b.address,
+                &checkpoint,
+                Phase::Path3,
             )
             .await?;
 
@@ -665,10 +692,12 @@ impl ChallengerE2e {
     ///
     /// The TEE proof is dropped through the game's own `nullify`, not by
     /// writing storage, so the game reaches the exact state a real TEE
-    /// nullification produces — `proofCount` and `expectedResolution` included.
-    /// Only the signature check is mocked, and only for that one transaction:
-    /// the driver key has no enclave to sign with. Everything the challenger
-    /// then does runs against the real, restored verifiers.
+    /// nullification produces — `proofCount` and `expectedResolution` included,
+    /// and the TEE verifier's global `nullified` flag, which the mock sets
+    /// through the same call a real one would. Only the signature check is
+    /// mocked, for that one transaction: the driver key has no enclave to sign
+    /// with. In `real` prover mode everything the challenger then does runs
+    /// against the real, restored verifier.
     ///
     /// The root must be patched *before* the TEE proof is dropped, and cannot be
     /// ordered the other way round: `nullify` refutes a checkpoint by proving a
@@ -679,8 +708,8 @@ impl ChallengerE2e {
     /// becomes the ZK-only shape under test.
     ///
     /// Returns the challenger's nonce, sampled before the fork is corrupted,
-    /// and the `invalid_dual_proposal_detected_total` reading from before
-    /// staging began.
+    /// the `invalid_dual_proposal_detected_total` reading from before staging
+    /// began, and the checkpoint that was corrupted.
     ///
     /// The counter is *not* judged here. The driver increments it only after
     /// awaiting `validate_game` — a round trip to the L2 RPC — so a scan that
@@ -696,7 +725,7 @@ impl ChallengerE2e {
         driver: &PrivateKeySigner,
         challenger: &PrivateKeySigner,
         game: Candidate,
-    ) -> Result<(u64, f64)> {
+    ) -> Result<(u64, f64, Checkpoint)> {
         let fork_config = Self::fork_config(config, fork_url, driver, game);
         // Sampled before anything is staged, for the reason given in `run_path1`.
         let nonce = provider.get_transaction_count(challenger.address()).await?;
@@ -730,17 +759,22 @@ impl ChallengerE2e {
             tee_verifier = %tee_verifier,
             "corrupted the dual-proof game; dropping its TEE proof to stage Path 3"
         );
-        let receipt = Self::with_permissive_verifier(provider, tee_verifier, async {
-            tx_manager
-                .send(TxCandidate {
-                    tx_data: calldata,
-                    to: Some(game.address),
-                    ..Default::default()
-                })
-                .await
-                .map_err(Self::name_revert)
-                .context("failed to submit the Path 3 TEE nullify")
-        })
+        let receipt = Self::with_mock_verifier(
+            provider,
+            tee_verifier,
+            config.anchor_state_registry_addr,
+            async {
+                tx_manager
+                    .send(TxCandidate {
+                        tx_data: calldata,
+                        to: Some(game.address),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(Self::name_revert)
+                    .context("failed to submit the Path 3 TEE nullify")
+            },
+        )
         .await?;
         ensure!(
             receipt.inner.status(),
@@ -768,15 +802,12 @@ impl ChallengerE2e {
             state.countered_index
         );
 
-        // A real TEE nullification also nullifies the TEE verifier globally, and
-        // the permissive runtime that stood in for it returned success without
-        // setting that flag. Restoring the bytecode therefore leaves a verifier
-        // that is still live, so other games on the fork could go on verifying
-        // TEE proofs — the one way this staged state would differ from a genuine
-        // TEE-first Path 4. `nullified` is the sole storage variable of the
-        // shared `Verifier` base (`Verifier.sol:14`; `TEEVerifier` adds only an
-        // immutable, which lives in code), so it is slot 0.
-        Self::set_verifier_nullified(provider, tee_verifier).await?;
+        // A real TEE nullification also nullifies the TEE verifier globally. The
+        // mock reached that through the game's own `nullify` call and its real
+        // registry guard, and the flag is storage, so it survives the restore.
+        // Checked rather than assumed: a live TEE verifier would let other games
+        // on the fork go on verifying TEE proofs, the one way this staged state
+        // would differ from a genuine TEE-first Path 4.
         ensure!(
             verifier
                 .verifier_nullified(tee_verifier)
@@ -795,38 +826,29 @@ impl ChallengerE2e {
             invalid_index = checkpoint.index,
             "staged Path 3: an invalid ZK-only proposal"
         );
-        Ok((nonce, dual_detected))
+        Ok((nonce, dual_detected, checkpoint))
     }
 
-    /// Runs `operation` with `verifier`'s bytecode replaced by
-    /// [`PERMISSIVE_VERIFIER_RUNTIME`], restoring it either way.
+    /// Runs `operation` with `verifier`'s code replaced by the mock verifier,
+    /// restoring it either way.
     ///
     /// The restore is asserted, not assumed: leaving a permissive verifier on
-    /// the fork would let every later assertion pass against a contract that
-    /// verifies nothing.
-    async fn with_permissive_verifier<T>(
+    /// the fork in `real` mode would let every later assertion pass against a
+    /// contract that verifies nothing. In `mock` mode the code restored is the
+    /// mock itself, which is installed for the whole run.
+    async fn with_mock_verifier<T>(
         provider: &RootProvider,
         verifier: Address,
+        registry: Address,
         operation: impl Future<Output = Result<T>>,
     ) -> Result<T> {
-        let original = provider
-            .get_code_at(verifier)
-            .await
-            .with_context(|| format!("failed to read the code at verifier {verifier}"))?;
-        Self::set_code(provider, verifier, Bytes::from_static(PERMISSIVE_VERIFIER_RUNTIME))
+        let original = mock_verifier::install(provider, verifier, registry)
             .await
             .with_context(|| format!("failed to mock the verifier at {verifier}"))?;
 
         let outcome = operation.await;
 
-        let restored = async {
-            Self::set_code(provider, verifier, original.clone()).await?;
-            let after = provider.get_code_at(verifier).await?;
-            ensure!(after == original, "verifier {verifier} did not read back as its own code");
-            Ok(())
-        }
-        .await
-        .with_context(|| {
+        let restored = mock_verifier::restore(provider, &original).await.with_context(|| {
             format!("failed to restore the verifier at {verifier}; the fork is now unsound")
         });
 
@@ -837,12 +859,110 @@ impl ChallengerE2e {
         }
     }
 
-    async fn set_code(provider: &RootProvider, address: Address, code: Bytes) -> Result<()> {
-        provider
-            .client()
-            .request::<_, ()>("anvil_setCode", (address, code))
-            .await
-            .with_context(|| format!("anvil_setCode failed for {address}"))
+    /// Replaces both verifiers of every game under test with the mock, for the
+    /// rest of the run.
+    ///
+    /// Games of one implementation share their verifiers, so this is normally
+    /// two addresses; collecting them per game keeps it correct if A and B come
+    /// from different implementations. Bystanders on the same verifiers see the
+    /// mock too, which is harmless: nothing on the fork submits proofs for them.
+    async fn install_mock_verifiers(
+        config: &Config,
+        provider: &RootProvider,
+        verifier: &AggregateVerifierContractClient,
+        games: [Address; 2],
+    ) -> Result<()> {
+        let mut verifiers = BTreeSet::new();
+        for game in games {
+            verifiers.insert(verifier.tee_verifier_address(game).await?);
+            verifiers.insert(verifier.zk_verifier_address(game).await?);
+        }
+        for address in &verifiers {
+            mock_verifier::install(provider, *address, config.anchor_state_registry_addr)
+                .await
+                .with_context(|| format!("failed to install the mock verifier at {address}"))?;
+        }
+        info!(
+            phase = %Phase::Setup,
+            verifiers = ?verifiers,
+            "installed mock verifiers; proofs are no longer checked on this fork"
+        );
+        Ok(())
+    }
+
+    /// What the verifier used to check, checked here instead.
+    ///
+    /// A dispute carries the root its proof claims is correct at an index. The
+    /// game only checks that root against its *own* stored one (it must differ,
+    /// or for a challenged index match); that it is the *canonical* root was
+    /// the proof's job. Under the mock verifier nothing checks it, so a
+    /// challenger that proved the wrong root, or the wrong checkpoint, would
+    /// still land its dispute. Every successful dispute the challenger sent to
+    /// `game` must name the corrupted index and its canonical root.
+    ///
+    /// Read from the challenger's mined transactions, so it holds in `real`
+    /// mode too, where it costs nothing and confirms what the proof proved.
+    async fn assert_disputes_prove_canonical(
+        config: &Config,
+        provider: &RootProvider,
+        challenger: &PrivateKeySigner,
+        game: Address,
+        checkpoint: &Checkpoint,
+        phase: Phase,
+    ) -> Result<()> {
+        let latest = provider.get_block_number().await?;
+        let mut disputes = 0usize;
+        for number in config.fork_block + 1..=latest {
+            let Some(block) =
+                provider.get_block_by_number(BlockNumberOrTag::Number(number)).full().await?
+            else {
+                continue;
+            };
+            for tx in block.transactions.into_transactions() {
+                if tx.from() != challenger.address() || tx.to() != Some(game) {
+                    continue;
+                }
+                let Some(call) = decode_dispute_calldata(tx.input()) else {
+                    continue;
+                };
+                let receipt = provider
+                    .get_transaction_receipt(tx.tx_hash())
+                    .await?
+                    .ok_or_else(|| eyre!("no receipt for mined transaction {}", tx.tx_hash()))?;
+                // A reverted dispute changed nothing, so it proved nothing either.
+                if !receipt.status() {
+                    continue;
+                }
+                ensure!(
+                    call.intermediate_root_index == U256::from(checkpoint.index)
+                        && call.intermediate_root_to_prove == checkpoint.expected_root,
+                    "the challenger's {:?} {} on game {game} proved root {} at index {}, but the \
+                     corrupted checkpoint is index {} with canonical root {}",
+                    call.kind,
+                    tx.tx_hash(),
+                    call.intermediate_root_to_prove,
+                    call.intermediate_root_index,
+                    checkpoint.index,
+                    checkpoint.expected_root
+                );
+                disputes += 1;
+            }
+        }
+        ensure!(
+            disputes > 0,
+            "game {game} was disputed, but no successful nullify or challenge from the challenger \
+             to it was found after fork block {}",
+            config.fork_block
+        );
+        info!(
+            phase = %phase,
+            game = %game,
+            disputes,
+            index = checkpoint.index,
+            root = %checkpoint.expected_root,
+            "every dispute proved the canonical root at the corrupted index"
+        );
+        Ok(())
     }
 
     /// Path 3: the challenger must clear the invalid ZK-only proposal.
@@ -975,26 +1095,6 @@ impl ChallengerE2e {
         )
     }
 
-    /// Sets a verifier's `nullified` flag directly, reproducing the global side
-    /// effect of a real `nullify`.
-    ///
-    /// `nullified` is the only storage variable of the shared `Verifier` base,
-    /// so it occupies slot 0. Written with `anvil_setStorageAt` rather than by
-    /// calling `Verifier.nullify()`, because that function is callable only by a
-    /// registered, respected dispute game and the driver is not one.
-    async fn set_verifier_nullified(provider: &RootProvider, verifier: Address) -> Result<()> {
-        let updated = provider
-            .client()
-            .request::<_, bool>(
-                "anvil_setStorageAt",
-                (verifier, B256::ZERO, B256::with_last_byte(1)),
-            )
-            .await
-            .with_context(|| format!("anvil_setStorageAt failed for verifier {verifier}"))?;
-        ensure!(updated, "anvil_setStorageAt returned false for verifier {verifier}");
-        Ok(())
-    }
-
     /// Times the challenger has classified a game as `InvalidDualProposal`.
     ///
     /// Path 3 staging exposes that shape for one Anvil write plus one
@@ -1019,7 +1119,12 @@ impl ChallengerE2e {
     /// blocked on this file appearing.
     ///
     /// Written via a rename so the sidecar can never source a partial file.
-    fn release_challenger(fork_url: &Url, signer: &PrivateKeySigner) -> Result<()> {
+    fn release_challenger(
+        path: &Path,
+        fork_url: &Url,
+        zk_rpc_url: &Url,
+        signer: &PrivateKeySigner,
+    ) -> Result<()> {
         // Sourced after /envmapper/mapping.env, so these override the
         // config-service values for the run.
         //
@@ -1031,11 +1136,11 @@ impl ChallengerE2e {
             "unset BASE_CHALLENGER_SIGNER_ENDPOINT\n\
              unset BASE_CHALLENGER_SIGNER_ADDRESS\n\
              export BASE_CHALLENGER_L1_ETH_RPC={fork_url}\n\
+             export BASE_CHALLENGER_ZK_RPC_URL={zk_rpc_url}\n\
              export BASE_CHALLENGER_PRIVATE_KEY={}\n",
             hex::encode_prefixed(signer.to_bytes())
         );
 
-        let path = Path::new(CHALLENGER_ENV_FILE);
         let staging = path.with_extension("tmp");
         std::fs::write(&staging, contents)
             .with_context(|| format!("failed to write {}", staging.display()))?;
@@ -1173,6 +1278,15 @@ impl ChallengerE2e {
             checkpoint.index + 1,
         )
         .await?;
+        Self::assert_disputes_prove_canonical(
+            config,
+            provider,
+            challenger,
+            game.address,
+            &checkpoint,
+            Phase::Path1,
+        )
+        .await?;
         Ok((outcome, checkpoint))
     }
 
@@ -1296,6 +1410,17 @@ impl ChallengerE2e {
             challenger,
             nonce,
             "Path 2 fraudulent challenge nullified",
+        )
+        .await?;
+        // Covers Path 1's challenge as well as this nullify: both name the same
+        // index, and in both the canonical root is the one to prove.
+        Self::assert_disputes_prove_canonical(
+            config,
+            provider,
+            challenger,
+            game.address,
+            &checkpoint,
+            Phase::Path2Dispute,
         )
         .await?;
         info!(
@@ -1494,6 +1619,15 @@ impl ChallengerE2e {
             game.address,
             nonce_after - nonce
         );
+        Self::assert_disputes_prove_canonical(
+            config,
+            provider,
+            challenger,
+            game.address,
+            &checkpoint,
+            Phase::Path4,
+        )
+        .await?;
         info!(
             phase = %Phase::Path4,
             verdict = %Verdict::Pass,
@@ -1713,58 +1847,6 @@ impl RevertData for ProofSubmissionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The verifier mock must never outlive the call it was installed for:
-    /// a fork left with a permissive verifier passes every later assertion.
-    #[tokio::test]
-    async fn permissive_verifier_is_restored_on_both_paths() {
-        let anvil = Anvil::new().spawn();
-        let provider: RootProvider = RootProvider::new_http(anvil.endpoint_url());
-        let verifier = Address::repeat_byte(0x42);
-        let original = Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xf3]);
-        ChallengerE2e::set_code(&provider, verifier, original.clone()).await.expect("seed code");
-
-        let assert_mocked = || async {
-            let code = provider.get_code_at(verifier).await.expect("read code");
-            assert_eq!(code.as_ref(), PERMISSIVE_VERIFIER_RUNTIME);
-        };
-
-        let value = ChallengerE2e::with_permissive_verifier(&provider, verifier, async {
-            assert_mocked().await;
-            Ok(7)
-        })
-        .await
-        .expect("operation succeeded");
-        assert_eq!(value, 7);
-        assert_eq!(provider.get_code_at(verifier).await.expect("read code"), original);
-
-        let error = ChallengerE2e::with_permissive_verifier(&provider, verifier, async {
-            assert_mocked().await;
-            Err::<(), _>(eyre!("operation failed"))
-        })
-        .await
-        .expect_err("operation failed");
-        assert_eq!(error.to_string(), "operation failed");
-        assert_eq!(provider.get_code_at(verifier).await.expect("read code"), original);
-    }
-
-    /// Restoring the mocked bytecode is not enough: a real `nullify(TEE, ...)`
-    /// also sets the verifier's `nullified` flag, and the permissive runtime
-    /// returns success without touching storage.
-    #[tokio::test]
-    async fn set_verifier_nullified_writes_slot_zero() {
-        let anvil = Anvil::new().spawn();
-        let provider: RootProvider = RootProvider::new_http(anvil.endpoint_url());
-        let verifier = Address::repeat_byte(0x43);
-
-        let before = provider.get_storage_at(verifier, U256::ZERO).await.expect("read slot 0");
-        assert_eq!(before, U256::ZERO, "slot 0 starts clear");
-
-        ChallengerE2e::set_verifier_nullified(&provider, verifier).await.expect("nullify");
-
-        let after = provider.get_storage_at(verifier, U256::ZERO).await.expect("read slot 0");
-        assert_eq!(after, U256::from(1), "`nullified` is slot 0 of the Verifier base");
-    }
 
     /// The point of the helper: a zeronet run failed on a bare `0x09bde339`,
     /// which cost a manual keccak sweep to identify.
