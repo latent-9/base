@@ -164,7 +164,7 @@ impl Channel {
         }
 
         // Must have the possibility of contiguous frames.
-        if self.inputs.len() != (self.last_frame_number + 1) as usize {
+        if self.inputs.len() != usize::from(self.last_frame_number) + 1 {
             return false;
         }
 
@@ -362,5 +362,22 @@ mod tests {
         ];
 
         test_cases.into_iter().for_each(run_frame_validity_test);
+    }
+
+    #[test]
+    fn is_ready_handles_a_full_u16_frame_count_channel() {
+        // A channel with 65536 frames (frame numbers 0..=65535) is protocol
+        // valid: the frame number is a u16 on the wire, and the assembler
+        // accepts it, comparing in usize. The readiness check must handle it
+        // the same way instead of overflowing.
+        let id = [7u8; 16];
+        let block = BlockInfo::default();
+        let mut channel = Channel::new(id, block);
+        for i in 0..=u16::MAX {
+            channel
+                .add_frame(Frame { id, number: i, data: Vec::new(), is_last: i == u16::MAX }, block)
+                .unwrap();
+        }
+        assert!(channel.is_ready(), "a complete 65536-frame channel must be ready");
     }
 }
